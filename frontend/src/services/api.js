@@ -1,5 +1,71 @@
 import axios from 'axios';
 import toast from 'react-hot-toast';
+import { logError, createErrorObject, categorizeError, getErrorConfig, ErrorStrategies } from '../utils/errorHandler';
+
+// Token management utilities
+class TokenManager {
+  static isTokenExpired(token) {
+    if (!token) return true;
+    
+    try {
+      const payload = JSON.parse(atob(token.split('.')[1]));
+      const currentTime = Date.now() / 1000;
+      // Check if token expires within next 5 minutes
+      return payload.exp < (currentTime + 300);
+    } catch (error) {
+      console.warn('Error parsing token:', error);
+      return true;
+    }
+  }
+
+  static async refreshToken() {
+    const currentToken = localStorage.getItem('token');
+    if (!currentToken) {
+      throw new Error('No token to refresh');
+    }
+
+    try {
+      const response = await axios.post(
+        `${process.env.REACT_APP_API_URL || 'http://localhost:5000/api'}/auth/refresh`,
+        {},
+        {
+          headers: {
+            'Authorization': `Bearer ${currentToken}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 5000
+        }
+      );
+
+      const newToken = response.data.data.token;
+      localStorage.setItem('token', newToken);
+      return newToken;
+    } catch (error) {
+      console.error('Token refresh failed:', error);
+      localStorage.removeItem('token');
+      localStorage.removeItem('user');
+      throw error;
+    }
+  }
+
+  static async getValidToken() {
+    const token = localStorage.getItem('token');
+    
+    if (!token) {
+      return null;
+    }
+
+    if (this.isTokenExpired(token)) {
+      try {
+        return await this.refreshToken();
+      } catch (error) {
+        return null;
+      }
+    }
+
+    return token;
+  }
+}
 
 // Create axios instance with base configuration
 const api = axios.create({
@@ -10,13 +76,31 @@ const api = axios.create({
   },
 });
 
-// Request interceptor to add auth token
+// Request interceptor to add auth token with validation
 api.interceptors.request.use(
-  (config) => {
-    const token = localStorage.getItem('token');
-    if (token) {
-      config.headers.Authorization = `Bearer ${token}`;
+  async (config) => {
+    // Skip token validation for auth endpoints
+    if (config.url?.includes('/auth/login') || 
+        config.url?.includes('/auth/register') ||
+        config.url?.includes('/auth/refresh')) {
+      const token = localStorage.getItem('token');
+      if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+      }
+      return config;
     }
+
+    // For other endpoints, ensure we have a valid token
+    try {
+      const validToken = await TokenManager.getValidToken();
+      if (validToken) {
+        config.headers.Authorization = `Bearer ${validToken}`;
+      }
+    } catch (error) {
+      console.warn('Failed to get valid token:', error);
+      // Continue without token - let the response interceptor handle 401
+    }
+
     return config;
   },
   (error) => {
@@ -24,61 +108,96 @@ api.interceptors.request.use(
   }
 );
 
-// Response interceptor for error handling
+// Response interceptor for error handling with enhanced categorization
 api.interceptors.response.use(
   (response) => {
     return response;
   },
-  (error) => {
-    // Enhanced error handling
-    const errorData = error.response?.data?.error || {};
-    const status = error.response?.status;
-    const message = errorData.message || 'An error occurred';
+  async (error) => {
+    const originalRequest = error.config;
     
-    // Add error code and details to the error object
-    error.code = errorData.code;
-    error.details = errorData.details;
+    // Create standardized error object
+    const errorObj = createErrorObject(error, {
+      url: originalRequest?.url,
+      method: originalRequest?.method,
+      timestamp: new Date().toISOString()
+    });
     
-    // Handle specific error cases
-    if (status === 401) {
-      // Don't show toast for token refresh attempts
-      if (!error.config?.url?.includes('/auth/refresh')) {
+    // Log error for debugging
+    logError(error, errorObj.context);
+    
+    // Handle 401 errors with token refresh retry
+    if (error.response?.status === 401 && !originalRequest._retry) {
+      originalRequest._retry = true;
+      
+      // Don't retry for auth endpoints
+      if (originalRequest.url?.includes('/auth/login') || 
+          originalRequest.url?.includes('/auth/register') ||
+          originalRequest.url?.includes('/auth/refresh')) {
+        
+        if (originalRequest.url?.includes('/auth/refresh')) {
+          // Token refresh failed, clear auth data
+          localStorage.removeItem('token');
+          localStorage.removeItem('user');
+          
+          if (window.location.pathname !== '/login') {
+            toast.error('Session expired. Please login again.');
+            window.location.href = '/login';
+          }
+        }
+        return Promise.reject(errorObj);
+      }
+
+      // Try to refresh token and retry the original request
+      try {
+        const newToken = await TokenManager.refreshToken();
+        originalRequest.headers.Authorization = `Bearer ${newToken}`;
+        return api(originalRequest);
+      } catch (refreshError) {
+        // Token refresh failed, redirect to login
         localStorage.removeItem('token');
         localStorage.removeItem('user');
         
-        // Only redirect if not already on login page
         if (window.location.pathname !== '/login') {
           toast.error('Session expired. Please login again.');
           window.location.href = '/login';
         }
+        return Promise.reject(errorObj);
       }
-    } else if (status === 403) {
-      toast.error('Access denied');
-    } else if (status === 404) {
-      // Don't show toast for 404s on optional resources
-      if (!error.config?.suppressNotFoundToast) {
-        toast.error('Resource not found');
-      }
-    } else if (status === 409) {
-      // Conflict errors (like insufficient stock)
-      toast.error(message);
-    } else if (status === 422) {
-      // Validation errors - don't show toast as they should be handled by forms
-      console.warn('Validation error:', errorData);
-    } else if (status >= 500) {
-      toast.error('Server error. Please try again later.');
-    } else if (status >= 400) {
-      // Other client errors
-      toast.error(message);
     }
     
-    // Handle network errors
-    if (!error.response && error.request) {
-      error.code = 'NETWORK_ERROR';
-      toast.error('Network error. Please check your connection.');
+    // Handle errors based on strategy
+    const config = getErrorConfig(errorObj.code);
+    
+    switch (config.strategy) {
+      case ErrorStrategies.SHOW_ERROR:
+        if (!originalRequest.suppressToast) {
+          toast.error(errorObj.message);
+        }
+        break;
+        
+      case ErrorStrategies.SILENT_FAIL:
+        // Don't show toast for silent failures
+        break;
+        
+      case ErrorStrategies.REDIRECT_LOGIN:
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        if (window.location.pathname !== '/login') {
+          toast.error(errorObj.message);
+          window.location.href = '/login';
+        }
+        break;
+        
+      default:
+        // For other strategies, show the error message unless suppressed
+        if (!originalRequest.suppressToast && config.strategy !== ErrorStrategies.RETRY_WITH_BACKOFF) {
+          toast.error(errorObj.message);
+        }
+        break;
     }
     
-    return Promise.reject(error);
+    return Promise.reject(errorObj);
   }
 );
 
@@ -89,6 +208,7 @@ export const authAPI = {
   getProfile: () => api.get('/auth/profile'),
   updateProfile: (profileData) => api.put('/auth/profile', profileData),
   logout: () => api.post('/auth/logout'),
+  refreshToken: () => api.post('/auth/refresh'),
 };
 
 // Products API calls
@@ -99,7 +219,7 @@ export const productsAPI = {
   getProductsByCategory: (category) => api.get(`/products/category/${category}`),
 };
 
-// Cart API calls
+// Enhanced Cart API calls with retry logic
 export const cartAPI = {
   getCart: () => api.get('/cart'),
   addToCart: (item) => api.post('/cart/add', item),
@@ -108,6 +228,46 @@ export const cartAPI = {
   clearCart: () => api.delete('/cart/clear'),
   getCartTotal: () => api.get('/cart/total'),
   migrateCart: (guestCartItems) => api.post('/cart/merge', { items: guestCartItems }),
+  
+  // Enhanced methods with retry logic (to be used by CartContext)
+  getCartWithRetry: async (context = {}) => {
+    const { retryCartOperation } = await import('../utils/retryHandler');
+    return retryCartOperation(() => api.get('/cart'), { operation: 'getCart', ...context });
+  },
+  
+  addToCartWithRetry: async (item, context = {}) => {
+    const { retryCartOperation } = await import('../utils/retryHandler');
+    return retryCartOperation(() => api.post('/cart/add', item), { operation: 'addToCart', item, ...context });
+  },
+  
+  updateCartItemWithRetry: async (item, context = {}) => {
+    const { retryCartOperation } = await import('../utils/retryHandler');
+    return retryCartOperation(() => api.put('/cart/update', item), { operation: 'updateCartItem', item, ...context });
+  },
+  
+  removeFromCartWithRetry: async (productId, size, context = {}) => {
+    const { retryCartOperation } = await import('../utils/retryHandler');
+    return retryCartOperation(() => api.delete(`/cart/remove/${productId}/${size}`), { 
+      operation: 'removeFromCart', 
+      productId, 
+      size, 
+      ...context 
+    });
+  },
+  
+  clearCartWithRetry: async (context = {}) => {
+    const { retryCartOperation } = await import('../utils/retryHandler');
+    return retryCartOperation(() => api.delete('/cart/clear'), { operation: 'clearCart', ...context });
+  },
+  
+  migrateCartWithRetry: async (guestCartItems, context = {}) => {
+    const { retryCartOperation } = await import('../utils/retryHandler');
+    return retryCartOperation(() => api.post('/cart/merge', { items: guestCartItems }), { 
+      operation: 'migrateCart', 
+      itemCount: guestCartItems.length, 
+      ...context 
+    });
+  }
 };
 
 // Orders API calls
@@ -124,5 +284,8 @@ export const paymentAPI = {
   initiatePayment: (paymentData) => api.post('/payment/initiate', paymentData),
   getPaymentStatus: (orderId) => api.get(`/payment/status/${orderId}`),
 };
+
+// Export TokenManager for external use
+export { TokenManager };
 
 export default api;
